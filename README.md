@@ -1,12 +1,15 @@
 # gdscloud: Cloud Storage Access for GDS Files
 
+[![R-CMD-check](https://github.com/zhengxwen/gdscloud/actions/workflows/R-CMD-check.yml/badge.svg)](https://github.com/zhengxwen/gdscloud/actions/workflows/R-CMD-check.yml)
+
 GDS (Genomic Data Structure) is a high-performance file format for storing and accessing large-scale genomic data, implemented by the [gdsfmt](https://bioconductor.org/packages/gdsfmt) package. It supports hierarchical data organization with efficient random access and data compression.
 
 The `gdscloud` package extends `gdsfmt` to provide transparent read-only access
 to GDS files stored on cloud storage services or any HTTP/HTTPS URL:
 
 - **HTTP/HTTPS** (`http://` or `https://` URLs)
-- **Amazon S3** (`s3://bucket/key`)
+- **Amazon S3** (`s3://bucket/key`), and S3-compatible services such as
+  MinIO, Ceph, Cloudflare R2, Wasabi or Backblaze B2 via a custom endpoint
 - **Google Cloud Storage** (`gs://bucket/key`)
 - **Azure Blob Storage** (`az://container/blob`)
 
@@ -22,7 +25,7 @@ BiocManager::install("gdscloud")
 ## System Requirements
 
 - libcurl >= 7.28.0
-- gdsfmt >= 1.48.1
+- gdsfmt >= 1.49.7
 - Windows source builds require Rtools and `LIB_CURL` to point to the curl
     toolchain path used by [src/Makevars.win](src/Makevars.win).
 
@@ -108,6 +111,14 @@ gdsCloudConfigHTTP(bearer_token = "other_token", url = "https://private.example.
 # only http:// and https:// prefixes are accepted for `url`
 ```
 
+Token arguments (`access_token` for GCS and Azure, `bearer_token` for HTTP)
+can also be a function returning the token; it is called each time a file
+is opened, so expiring tokens are refreshed automatically (e.g.
+`gdsCloudConfigGCS(access_token = function()
+system2("gcloud", c("auth", "print-access-token"), stdout = TRUE))`). For AWS
+temporary credentials, `gdsCloudConfigS3(credentials = function() list(...))`
+returns the access key, secret and session token together.
+
 ### AWS S3
 Set environment variables (via `Sys.setenv()` in R, or the corresponding
 `NAME=value` lines in `~/.Renviron`):
@@ -129,6 +140,18 @@ gdsCloudConfigS3(
     region = "us-east-1"
 )
 ```
+
+For an S3-compatible service, add its endpoint (path-style addressing is
+used by default for custom endpoints):
+```r
+gdsCloudConfigS3(
+    aws_access_key_id = "minioadmin",
+    aws_secret_access_key = "minioadmin",
+    endpoint = "http://minio.lab.internal:9000"
+)
+gds <- gdsCloudOpen("s3://genomics/hapmap.gds")
+```
+The endpoint can also come from the `AWS_ENDPOINT_URL` environment variable.
 
 ### Google Cloud Storage
 ```r
@@ -155,6 +178,14 @@ Sys.setenv(AZURE_STORAGE_SAS_TOKEN = "your_sas")
 Or:
 ```r
 gdsCloudConfigAzure(account_name = "your_account", account_key = "your_key")
+
+# Entra ID (OAuth2) token instead of a key, e.g. from
+#   az account get-access-token --resource https://storage.azure.com/
+gdsCloudConfigAzure(account_name = "your_account", access_token = "eyJ0eXAi...")
+
+# sovereign clouds and local emulators
+gdsCloudConfigAzure(endpoint_suffix = "blob.core.chinacloudapi.cn")
+gdsCloudConfigAzure(endpoint = "http://127.0.0.1:10000/devstoreaccount1")
 ```
 
 ## Cache Control

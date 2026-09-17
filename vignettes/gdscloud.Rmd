@@ -1,7 +1,7 @@
 ---
 title: "Cloud Storage Access for GDS Files"
 author: "Xiuwen Zheng"
-date: "2026-05-01"
+date: "2026-09-16"
 output:
     BiocStyle::html_document:
         toc: true
@@ -26,7 +26,8 @@ The `r BiocStyle::Biocpkg("gdscloud")` package extends `r BiocStyle::Biocpkg("gd
 Supported backends:
 
 - **HTTP/HTTPS** — any `http://` or `https://` URL (public or authenticated)
-- **Amazon S3** — URLs of the form `s3://bucket/key`
+- **Amazon S3** — URLs of the form `s3://bucket/key`; S3-compatible services
+  (MinIO, Ceph RGW, Cloudflare R2, Wasabi, Backblaze B2, ...) via a custom endpoint
 - **Google Cloud Storage** — URLs of the form `gs://bucket/key`
 - **Azure Blob Storage** — URLs of the form `az://container/blob`
 
@@ -155,6 +156,41 @@ gds <- gdsCloudOpen("s3://my-bucket/path/to/file.gds")
 closefn.gds(gds)
 ```
 
+### S3-compatible services
+
+Any service implementing the S3 API (MinIO, Ceph RGW, Cloudflare R2, Wasabi,
+Backblaze B2, DigitalOcean Spaces, ...) can be used by pointing the S3
+backend at its endpoint. Path-style addressing (`https://host/bucket/key`)
+is the default for a custom endpoint; `region` is still part of the
+signature and should be set to what the service documents:
+
+```{r auth-s3-compat}
+# a MinIO or Ceph instance on the local network
+gdsCloudConfigS3(
+    aws_access_key_id = "minioadmin",
+    aws_secret_access_key = "minioadmin",
+    endpoint = "http://minio.lab.internal:9000"
+)
+
+# Cloudflare R2, scoped to one bucket
+gdsCloudConfigS3(
+    aws_access_key_id = "R2_KEY",
+    aws_secret_access_key = "R2_SECRET",
+    region = "auto",
+    endpoint = "https://ACCOUNT_ID.r2.cloudflarestorage.com",
+    url = "s3://my-r2-bucket/"
+)
+```
+
+The endpoint can also be given through the `AWS_ENDPOINT_URL_S3` or
+`AWS_ENDPOINT_URL` environment variable, as understood by the AWS CLI and
+SDKs. Then open `s3://bucket/key` as usual:
+
+```{r open-s3-compat, eval=FALSE}
+gds <- gdsCloudOpen("s3://genomics/hapmap.gds")
+closefn.gds(gds)
+```
+
 ## Google Cloud Storage
 
 **Environment variable:**
@@ -201,12 +237,77 @@ gdsCloudConfigAzure(
 )
 ```
 
+An OAuth2 access token from Microsoft Entra ID (for example from
+`az account get-access-token --resource https://storage.azure.com/`, or a
+managed identity) can be used instead of a key or SAS token, and sovereign
+clouds or local emulators are reached through `endpoint_suffix` or a full
+`endpoint`:
+
+```{r auth-azure-token}
+gdsCloudConfigAzure(
+    account_name = "mystorageaccount",
+    access_token = "eyJ0eXAiOiJKV1QiLCJhbGci...",
+    endpoint_suffix = "blob.core.chinacloudapi.cn"   # Azure China
+)
+# Azurite emulator
+gdsCloudConfigAzure(
+    account_name = "devstoreaccount1",
+    account_key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
+    endpoint = "http://127.0.0.1:10000/devstoreaccount1"
+)
+```
+
 Then open:
 
 ```{r open-azure, eval=FALSE}
 gds <- gdsCloudOpen("az://my-container/path/to/file.gds")
 closefn.gds(gds)
 ```
+
+## Short-lived tokens: token provider functions
+
+Google OAuth2 access tokens and Microsoft Entra ID tokens expire after
+about an hour. Instead of a fixed string, the token arguments
+(`access_token` for GCS and Azure, `bearer_token` for HTTP) accept a
+function that returns the token; it is called each time a file is opened,
+so a fresh token is fetched automatically. This is also the way to reuse
+the login machinery of dedicated packages:
+
+```{r auth-provider, eval=FALSE}
+# Google Cloud Storage via gargle, or via the gcloud CLI
+gdsCloudConfigGCS(access_token = function() {
+    scope <- "https://www.googleapis.com/auth/devstorage.read_only"
+    gargle::token_fetch(scopes = scope)$credentials$access_token
+})
+gdsCloudConfigGCS(access_token = function()
+    system2("gcloud", c("auth", "print-access-token"), stdout = TRUE))
+
+# Azure via AzureAuth
+gdsCloudConfigAzure(account_name = "mystorageaccount", access_token = function()
+    AzureAuth::get_azure_token("https://storage.azure.com/",
+        tenant = "mytenant", app = "myapp")$credentials$access_token)
+```
+
+AWS temporary credentials (STS, SSO, instance roles) are three values that
+expire together, so for S3 a single `credentials` function returns the
+whole set; the AWS CLI's `export-credentials` command resolves the complete
+AWS credential chain:
+
+```{r auth-provider-aws, eval=FALSE}
+gdsCloudConfigS3(credentials = function() {
+    out <- system2("aws", c("configure", "export-credentials",
+        "--format", "process"), stdout = TRUE)
+    j <- jsonlite::fromJSON(paste(out, collapse = ""))
+    list(aws_access_key_id = j$AccessKeyId,
+        aws_secret_access_key = j$SecretAccessKey,
+        session_token = j$SessionToken)
+})
+```
+
+A function returning `NULL` or `""` means no token is available and the
+next fallback is used. Provider functions are exported to parallel workers
+by `gdsCloudExportCredentials()` like any other credential. Static keys
+(AWS access keys, Azure account keys, SAS tokens) are given as strings.
 
 ## URL-specific credentials
 

@@ -56,10 +56,83 @@ gdsCloudSchemes <- function()
     c(
         http  = "HTTP",
         https = "HTTPS",
-        s3    = "Amazon S3",
+        s3    = "Amazon S3 (and S3-compatible services)",
         gs    = "Google Cloud Storage",
         az    = "Azure Blob Storage"
     )
+}
+
+
+#############################################################
+# Get or set the package options (timeouts, cache size)
+#
+gdsCloudOptions <- function(connect_timeout=NULL, timeout=NULL,
+    max_retries=NULL, cache_size=NULL)
+{
+    opt <- .gdscloud_env$options
+    check_num <- function(v, name, min)
+    {
+        if (!is.numeric(v) || length(v) != 1L || is.na(v) || v < min)
+        {
+            stop("'", name, "' must be a single number >= ", min, ".",
+                call.=FALSE)
+        }
+        as.numeric(v)
+    }
+    if (!is.null(connect_timeout))
+        opt$connect_timeout <- check_num(connect_timeout, "connect_timeout", 1)
+    if (!is.null(timeout))
+        opt$timeout <- check_num(timeout, "timeout", 1)
+    if (!is.null(max_retries))
+        opt$max_retries <- as.integer(check_num(max_retries, "max_retries", 0))
+    if (!is.null(cache_size))
+    {
+        opt$cache_size <- check_num(cache_size, "cache_size", 1)
+        .gdscloud_env$cache_size_mb <- opt$cache_size
+    }
+    .gdscloud_env$options <- opt
+    if (is.null(connect_timeout) && is.null(timeout) &&
+        is.null(max_retries) && is.null(cache_size))
+        opt
+    else
+        invisible(opt)
+}
+
+
+#############################################################
+# Internal: initialize the options at load time. Defaults can be
+# overridden persistently via R options ('gdscloud.<name>') or the
+# environment variables GDSCLOUD_<NAME>, e.g. in .Rprofile / .Renviron
+#
+.init_options <- function()
+{
+    get_num <- function(name, default, min=1)
+    {
+        raw <- getOption(paste0("gdscloud.", name),
+            Sys.getenv(paste0("GDSCLOUD_", toupper(name)), ""))
+        v <- suppressWarnings(as.numeric(raw))
+        if (length(v) == 1L && !is.na(v) && v >= min) v else default
+    }
+    .gdscloud_env$options <- list(
+        connect_timeout = get_num("connect_timeout", 30),
+        timeout         = get_num("timeout", 60),
+        max_retries     = as.integer(get_num("max_retries", 3, min=0)),
+        cache_size      = get_num("cache_size_mb", 64)
+    )
+    .gdscloud_env$cache_size_mb <- .gdscloud_env$options$cache_size
+    invisible()
+}
+
+
+#############################################################
+# Internal: push the transfer options (timeouts, retries) to the C code
+#
+.apply_options <- function()
+{
+    opt <- .gdscloud_env$options
+    .Call(gdscloud_set_options, opt$connect_timeout, opt$timeout,
+        opt$max_retries)
+    invisible()
 }
 
 
@@ -68,6 +141,7 @@ gdsCloudSchemes <- function()
 #
 .open_http <- function(url, ...)
 {
+    .apply_options()
     cred <- .get_http_credentials(url)
     cache_mb <- .gdscloud_env$cache_size_mb
     # Build auth header string (e.g. "Bearer <token>")
@@ -84,13 +158,14 @@ gdsCloudSchemes <- function()
 #
 .open_s3 <- function(url, ...)
 {
+    .apply_options()
     # get credentials (URL-specific entry takes priority)
     cred <- .get_s3_credentials(url)
     cache_mb <- .gdscloud_env$cache_size_mb
     # Call C function with credentials and cache size
     .Call(gdscloud_open_s3, url,
         cred$access_key, cred$secret_key, cred$region, cred$session_token,
-        cache_mb)
+        cred$endpoint, .flag_str(cred$path_style), cache_mb)
 }
 
 
@@ -99,6 +174,7 @@ gdsCloudSchemes <- function()
 #
 .open_gcs <- function(url, ...)
 {
+    .apply_options()
     cred <- .get_gcs_credentials(url)
     cache_mb <- .gdscloud_env$cache_size_mb
     # Call C function with credentials and cache size
@@ -111,9 +187,46 @@ gdsCloudSchemes <- function()
 #
 .open_azure <- function(url, ...)
 {
+    .apply_options()
     cred <- .get_azure_credentials(url)
     cache_mb <- .gdscloud_env$cache_size_mb
     # Call C function with credentials and cache size
     .Call(gdscloud_open_azure, url,
-        cred$account_name, cred$account_key, cred$sas_token, cache_mb)
+        cred$account_name, cred$account_key, cred$sas_token,
+        cred$access_token, cred$endpoint_suffix, cred$endpoint, cache_mb)
+}
+
+
+#############################################################
+# Internal: the request a provider would send (URL and headers) for
+# `url`, without sending it; used to check signatures in the tests
+#
+.prepare_request <- function(url, range="bytes=0-0", time=Sys.time())
+{
+    scheme <- sub("://.*", "", url)
+    params <- switch(scheme,
+        http =, https = {
+            cred <- .get_http_credentials(url)
+            list(auth = if (nzchar(cred$bearer_token))
+                paste("Bearer", cred$bearer_token) else "")
+        },
+        s3 = {
+            cred <- .get_s3_credentials(url)
+            cred$path_style <- .flag_str(cred$path_style)
+            cred
+        },
+        gs = .get_gcs_credentials(url),
+        az = .get_azure_credentials(url),
+        stop("Unsupported URL scheme: '", scheme, "'"))
+    .Call(gdscloud_prepare_request, url, params, range,
+        as.numeric(as.POSIXct(time, tz="UTC")))
+}
+
+
+#############################################################
+# Internal: a three-state logical as "TRUE" / "FALSE" / "" for .Call
+#
+.flag_str <- function(x)
+{
+    if (isTRUE(x)) "TRUE" else if (isFALSE(x)) "FALSE" else ""
 }

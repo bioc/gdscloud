@@ -1,3 +1,87 @@
+CHANGES IN VERSION 0.99.5
+-------------------------
+
+NEW FEATURES
+
+    o S3-compatible services: `gdsCloudConfigS3()` gains `endpoint=` and
+      `path_style=` (also read from AWS_ENDPOINT_URL_S3 / AWS_ENDPOINT_URL
+      and GDSCLOUD_S3_PATH_STYLE), so `s3://` URLs can point at MinIO,
+      Ceph RGW, Cloudflare R2, Wasabi, Backblaze B2, DigitalOcean Spaces
+      and other services implementing the S3 API
+
+    o Azure: `gdsCloudConfigAzure()` gains `access_token=` (OAuth2 /
+      Microsoft Entra ID), `endpoint_suffix=` (sovereign clouds such as
+      Azure China or Azure Government) and `endpoint=` (Azurite emulator
+      or any self-hosted blob endpoint); the corresponding
+      AZURE_STORAGE_* environment variables and the fields of
+      AZURE_STORAGE_CONNECTION_STRING are read as fallbacks
+
+    o The token arguments `access_token` (`gdsCloudConfigGCS()`,
+      `gdsCloudConfigAzure()`) and `bearer_token` (`gdsCloudConfigHTTP()`)
+      may be a function returning the token; it is called each time a
+      file is opened, so expiring tokens (Google OAuth2, Microsoft Entra
+      ID) can be refreshed by plugging in gargle, AzureAuth or similar
+      packages. Keys remain plain strings
+
+    o `gdsCloudConfigS3(credentials=)` takes a function returning the
+      access key, secret and session token as one set, called each time a
+      file is opened, for AWS temporary credentials (STS, SSO, instance
+      roles) obtained e.g. from `aws configure export-credentials` or
+      aws.signature
+
+    o Cloud requests now have a connect timeout (30 s) and a low-speed
+      timeout (60 s below 1 byte/s), so a stalled connection no longer
+      blocks R indefinitely
+
+    o New `gdsCloudOptions()` to get or set the package options in one
+      place: `connect_timeout`, `timeout`, `max_retries` and `cache_size`.
+      The initial
+      values can be set via the R options `gdscloud.connect_timeout`,
+      `gdscloud.timeout`, `gdscloud.cache_size_mb` or the corresponding
+      GDSCLOUD_* environment variables; `gdsCloudExportCredentials()`
+      copies the options to the workers as well
+
+    o Transfers can be interrupted with Ctrl-C; the interrupt is detected
+      from libcurl's progress callback and reported as an error
+
+    o Transient failures (connection resets, timeouts, HTTP 408/429/5xx)
+      are retried with exponential back-off, by default up to 3 times;
+      `gdsCloudOptions(max_retries=)` controls this and
+      `gdsCloudCacheInfo()` reports the number of retried requests
+
+USER-VISIBLE CHANGES
+
+    o Continuous integration: `R CMD check` and BiocCheck run on GitHub
+      Actions (Linux, macOS, Windows) for every push and pull request;
+      the tests use a local HTTP server (httpuv, callr) and need no
+      network or cloud account
+
+    o The four backends now share one generic libcurl backend
+      (src/curl_backend.c): transfers, Range validation, timeouts,
+      retries, interrupts, size detection and error formatting are
+      implemented once; a provider only resolves the URL and signs the
+      request. Error messages for HTTP failures now include the service's
+      request id when the response carries one
+
+    o Object keys and blob names are percent-encoded when building the
+      request URL (and the AWS SigV4 canonical URI), so keys containing
+      spaces, '+' or non-ASCII characters can be opened
+
+BUG FIXES
+
+    o Range reads now verify the server's response: a server that ignores
+      the HTTP Range header (answering 200 with the whole file) or reports
+      a different Content-Range start is rejected with a clear error;
+      previously the wrong bytes were silently cached as the requested
+      block. The transfer is aborted as soon as the mismatch is detected,
+      so the whole file is not downloaded.
+
+    o The Azure Shared Key is now base64-decoded once, into a bounded
+      buffer, when the file is opened; an invalid or over-long key gives an
+      immediate error instead of a stack buffer overflow (over-long input)
+      or an HMAC over garbage (decoding failure was ignored).
+
+
 CHANGES IN VERSION 0.99.4
 -------------------------
 

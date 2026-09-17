@@ -24,7 +24,7 @@
 gdsCloudCacheSize <- function(size_mb=64)
 {
     stopifnot(is.numeric(size_mb), length(size_mb)==1L, size_mb > 0)
-    .gdscloud_env$cache_size_mb <- size_mb
+    gdsCloudOptions(cache_size=size_mb)
     invisible(size_mb)
 }
 
@@ -55,6 +55,7 @@ gdsCloudCacheInfo <- function(verbose=TRUE)
             cat("  Open cloud streams:", info$num_streams, "\n")
             cat("  Global cache hits:", info$hits, "\n")
             cat("  Global cache misses:", info$misses, "\n")
+            cat("  Retried requests:", info$retries, "\n")
         }
     }
     invisible(info)

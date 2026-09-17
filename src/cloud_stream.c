@@ -14,6 +14,19 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include <R.h>
+#include <Rinternals.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#ifndef strncasecmp
+#define strncasecmp _strnicmp
+#endif
+#else
+#include <strings.h>
+#include <unistd.h>
+#endif
+
 
 // =====================================================================
 // Fork safety (Unix only)
@@ -238,6 +251,178 @@ void cloud_format_error(char *out, size_t out_size,
 		snprintf(out, out_size, "%s: HTTP %ld accessing '%s'",
 			prefix, http_code, endpoint);
 	}
+}
+
+
+// =====================================================================
+// Transfer setup: timeouts and user interrupts
+// =====================================================================
+
+static long g_connect_timeout = 30;   // seconds
+static long g_low_speed_time = 60;    // seconds below 1 byte/s before abort
+
+void cloud_set_timeouts(long connect_timeout, long low_speed_time)
+{
+	if (connect_timeout > 0) g_connect_timeout = connect_timeout;
+	if (low_speed_time > 0) g_low_speed_time = low_speed_time;
+}
+
+static void check_interrupt_fn(void *dummy)
+{
+	(void)dummy;
+	R_CheckUserInterrupt();
+}
+
+/// 1 if an interrupt is pending. R_CheckUserInterrupt() would longjmp to
+/// the top level; running it under R_ToplevelExec() confines the jump so
+/// the transfer can be aborted and unwound through the normal error path.
+static int pending_interrupt(void)
+{
+	return !R_ToplevelExec(check_interrupt_fn, NULL);
+}
+
+#if LIBCURL_VERSION_NUM >= 0x072000
+static int xferinfo_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+	curl_off_t ultotal, curl_off_t ulnow)
+{
+	(void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+#else
+static int xferinfo_cb(void *clientp, double dltotal, double dlnow,
+	double ultotal, double ulnow)
+{
+	(void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+#endif
+	CloudTransfer *tr = (CloudTransfer *)clientp;
+	if (pending_interrupt())
+	{
+		tr->interrupted = 1;
+		return 1;   // non-zero aborts the transfer
+	}
+	return 0;
+}
+
+void cloud_curl_setup(CURL *curl, CloudTransfer *tr)
+{
+	tr->interrupted = 0;
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, g_connect_timeout);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, g_low_speed_time);
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+#if LIBCURL_VERSION_NUM >= 0x072000
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, tr);
+#else
+	curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION, xferinfo_cb);
+	curl_easy_setopt(curl, CURLOPT_PROGRESSDATA, tr);
+#endif
+}
+
+int cloud_transfer_interrupted(const CloudTransfer *tr, CURLcode res,
+	const char *prefix, char *err, size_t err_size)
+{
+	(void)res;
+	if (tr->interrupted)
+	{
+		snprintf(err, err_size, "%s: transfer interrupted by the user", prefix);
+		return 1;
+	}
+	return 0;
+}
+
+
+// =====================================================================
+// Retries with exponential back-off
+// =====================================================================
+
+static int g_max_retries = 3;
+static long long g_total_retries = 0;
+
+void cloud_set_max_retries(int max_retries)
+{
+	if (max_retries >= 0) g_max_retries = max_retries;
+}
+
+long long cloud_total_retries(void)
+{
+	return g_total_retries;
+}
+
+static int curl_error_is_transient(CURLcode res)
+{
+	switch (res)
+	{
+		case CURLE_COULDNT_CONNECT:
+		case CURLE_OPERATION_TIMEDOUT:
+		case CURLE_SSL_CONNECT_ERROR:
+		case CURLE_SEND_ERROR:
+		case CURLE_RECV_ERROR:
+		case CURLE_PARTIAL_FILE:
+		case CURLE_GOT_NOTHING:
+#ifdef CURLE_HTTP2
+		case CURLE_HTTP2:
+#endif
+#ifdef CURLE_HTTP2_STREAM
+		case CURLE_HTTP2_STREAM:
+#endif
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+static int http_status_is_transient(long code)
+{
+	return code == 408 || code == 429 || code == 500 || code == 502 ||
+		code == 503 || code == 504;
+}
+
+static void sleep_ms(int ms)
+{
+#ifdef _WIN32
+	Sleep((DWORD)ms);
+#else
+	usleep((useconds_t)ms * 1000);
+#endif
+}
+
+/// sleep for `ms` milliseconds in small steps; return 1 if interrupted
+static int interruptible_sleep(int ms)
+{
+	while (ms > 0)
+	{
+		int step = (ms < 100) ? ms : 100;
+		sleep_ms(step);
+		ms -= step;
+		if (pending_interrupt()) return 1;
+	}
+	return 0;
+}
+
+int cloud_should_retry(CloudTransfer *tr, CURLcode res, CURL *curl,
+	int attempt)
+{
+	if (tr->interrupted || attempt >= g_max_retries) return 0;
+
+	int transient;
+	if (res != CURLE_OK)
+	{
+		transient = curl_error_is_transient(res);
+	} else {
+		long http_code = 0;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+		transient = http_status_is_transient(http_code);
+	}
+	if (!transient) return 0;
+
+	// 0.5 s, 1 s, 2 s, 4 s, 8 s, 8 s, ...
+	int backoff_ms = 500 << ((attempt < 4) ? attempt : 4);
+	if (interruptible_sleep(backoff_ms))
+	{
+		tr->interrupted = 1;
+		return 0;
+	}
+	g_total_retries++;
+	return 1;
 }
 
 

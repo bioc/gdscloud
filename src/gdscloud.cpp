@@ -1,7 +1,7 @@
 // ===========================================================
 // gdscloud: Cloud Storage Access for GDS Files
 //
-// gdscloud.c: R .Call entry points for opening cloud GDS files
+// gdscloud.cpp: R .Call entry points for opening cloud GDS files
 //
 // Copyright (C) 2026    Xiuwen Zheng
 //
@@ -10,6 +10,7 @@
 // ===========================================================
 
 #include "cloud_stream.h"
+#include "curl_backend.h"
 #include <R_GDS.h>
 #include <R_GDS_CPP.h>
 
@@ -18,6 +19,7 @@
 #include <R_ext/Rdynload.h>
 
 #include <vector>
+#include <string>
 #include <algorithm>
 
 
@@ -25,30 +27,27 @@
 static std::vector<CloudStream*> g_open_streams;
 
 
-// External declarations from C backend files
+// Providers implemented in the C files
 extern "C" {
 
-typedef struct HTTPBackendData HTTPBackendData;
-extern HTTPBackendData *http_backend_create(const char *url,
-	const char *auth_header);
-extern CloudBackend http_backend_vtable;
+extern const CurlProvider http_provider;
+extern void *http_provider_create(const char *url, const char *auth,
+	char *err, size_t err_size);
 
-typedef struct S3BackendData S3BackendData;
-extern S3BackendData *s3_backend_create(const char *s3_url,
-	const char *access_key, const char *secret_key,
-	const char *region, const char *session_token);
-extern CloudBackend s3_backend_vtable;
+extern const CurlProvider s3_provider;
+extern void *s3_provider_create(const char *url, const char *access_key,
+	const char *secret_key, const char *region, const char *session_token,
+	const char *endpoint, int path_style, char *err, size_t err_size);
 
-typedef struct GCSBackendData GCSBackendData;
-extern GCSBackendData *gcs_backend_create(const char *gs_url,
-	const char *access_token);
-extern CloudBackend gcs_backend_vtable;
+extern const CurlProvider gcs_provider;
+extern void *gcs_provider_create(const char *url, const char *access_token,
+	char *err, size_t err_size);
 
-typedef struct AzureBackendData AzureBackendData;
-extern AzureBackendData *azure_backend_create(const char *az_url,
-	const char *account_name, const char *account_key,
-	const char *sas_token);
-extern CloudBackend azure_backend_vtable;
+extern const CurlProvider azure_provider;
+extern void *azure_provider_create(const char *url, const char *account_name,
+	const char *account_key, const char *sas_token, const char *access_token,
+	const char *endpoint_suffix, const char *endpoint,
+	char *err, size_t err_size);
 
 } // extern "C"
 
@@ -126,9 +125,10 @@ static void gdscloud_cb_close(void *user_data)
 
 
 // =====================================================================
-// Helper: get a non-NA, non-empty string from SEXP, or return ""
+// Helpers
 // =====================================================================
 
+/// a non-NA, non-empty string from a character SEXP, or ""
 static const char *sexp_str(SEXP x)
 {
 	if (TYPEOF(x) != STRSXP || XLENGTH(x) == 0) return "";
@@ -137,11 +137,17 @@ static const char *sexp_str(SEXP x)
 	return CHAR(s);
 }
 
+/// a three-state flag from a character SEXP: "TRUE" -> 1, "FALSE" -> 0,
+/// anything else (including "" and NA) -> -1 (automatic)
+static int sexp_flag(SEXP x)
+{
+	const char *s = sexp_str(x);
+	if (strcmp(s, "TRUE") == 0) return 1;
+	if (strcmp(s, "FALSE") == 0) return 0;
+	return -1;
+}
 
-// =====================================================================
-// Helper: set attr(file_obj$filename, "pkgname") <- "gdscloud"
-// =====================================================================
-
+/// set attr(file_obj$filename, "pkgname") <- "gdscloud"
 static void set_pkgname_attr(SEXP file_obj)
 {
 	SEXP names = Rf_getAttrib(file_obj, R_NamesSymbol);
@@ -161,6 +167,60 @@ static void set_pkgname_attr(SEXP file_obj)
 	}
 }
 
+/// The common part of every open: wrap the provider in the generic
+/// backend, create the cached stream, pre-check access (for a detailed
+/// error message) and open through gdsfmt's callback-stream API.
+/// Takes ownership of `provider_data`.
+static SEXP open_cloud_gds(const char *url, const CurlProvider *provider,
+	void *provider_data, double cache_mb)
+{
+	CurlBackendData *bd = curl_backend_create(provider, provider_data);
+	if (!bd)
+		throw ErrGDSCloud("Failed to initialize libcurl for '%s'", url);
+
+	long long max_cache = (long long)(cache_mb * 1024 * 1024);
+	CloudStream *cs = cloud_stream_create(url, &curl_backend_vtable, bd,
+		CLOUD_BLOCK_SIZE, max_cache);
+	if (!cs)
+	{
+		curl_backend_vtable.close(bd);
+		throw ErrGDSCloud("Failed to create cloud stream for '%s'", url);
+	}
+
+	if (cloud_stream_getsize(cs) < 0)
+	{
+		const char *err = cloud_stream_get_last_error(cs);
+		std::string msg = (err && err[0]) ? std::string(err)
+			: std::string("Failed to access '") + url + "'";
+		cloud_stream_close(cs);
+		throw ErrGDSCloud(msg);
+	}
+
+	PdGDSFile file = GDS_File_Open_Callback(
+		cs,
+		(TdCbStreamRead)gdscloud_cb_read,
+		(TdCbStreamWrite)NULL,
+		(TdCbStreamSeek)gdscloud_cb_seek,
+		(TdCbStreamGetSize)gdscloud_cb_getsize,
+		(TdCbStreamSetSize)NULL,
+		(TdCbStreamClose)gdscloud_cb_close,
+		TRUE, FALSE);
+	if (!file)
+	{
+		cloud_stream_close(cs);
+		throw ErrGDSCloud("Failed to open GDS file from '%s': "
+			"the file may not exist, access may be denied, or it is not a "
+			"valid GDS file", url);
+	}
+
+	g_open_streams.push_back(cs);
+	SEXP ans = PROTECT(GDS_R_MakeFileObj(file, url, TRUE));
+	set_pkgname_attr(ans);
+	UNPROTECT(1);
+	return ans;
+}
+
+
 // =====================================================================
 // .Call: Open HTTP/HTTPS GDS file
 // =====================================================================
@@ -168,64 +228,17 @@ static void set_pkgname_attr(SEXP file_obj)
 extern "C" SEXP gdscloud_open_http(SEXP url, SEXP auth_header,
 	SEXP cache_size_mb)
 {
-	const char *c_url  = sexp_str(url);
-	const char *c_auth = sexp_str(auth_header);
-	double c_cache = Rf_asReal(cache_size_mb);
-
+	const char *c_url = sexp_str(url);
 	COREARRAY_TRY
-
-		// validate URL format
-		if (!c_url || !c_url[0])
+		if (!c_url[0])
 			throw ErrGDSCloud("HTTP URL is empty or missing");
-		if (strncmp(c_url, "http://", 7) != 0 && strncmp(c_url, "https://", 8) != 0)
-			throw ErrGDSCloud("Invalid HTTP URL '%s': must start with 'http://' or 'https://'", c_url);
-
-		// create HTTP backend
-		HTTPBackendData *http = http_backend_create(c_url, c_auth);
-		if (!http)
-			throw ErrGDSCloud("Failed to create HTTP backend for '%s'", c_url);
-
-		long long max_cache = (long long)(c_cache * 1024 * 1024);
-		CloudStream *cs = cloud_stream_create(c_url,
-			&http_backend_vtable, http, CLOUD_BLOCK_SIZE, max_cache);
-		if (!cs)
-		{
-			http_backend_vtable.close(http);
-			throw ErrGDSCloud("Failed to create cloud stream for '%s'", c_url);
-		}
-
-		// pre-check file access to get detailed error on failure
-		if (cloud_stream_getsize(cs) < 0)
-		{
-			const char *err = cloud_stream_get_last_error(cs);
-			std::string msg = (err && err[0]) ? std::string(err)
-				: std::string("Failed to access '") + c_url + "'";
-			cloud_stream_close(cs);
-			throw ErrGDSCloud(msg);
-		}
-
-		PdGDSFile file = GDS_File_Open_Callback(
-			cs,
-			(TdCbStreamRead)gdscloud_cb_read,
-			(TdCbStreamWrite)NULL,
-			(TdCbStreamSeek)gdscloud_cb_seek,
-			(TdCbStreamGetSize)gdscloud_cb_getsize,
-			(TdCbStreamSetSize)NULL,
-			(TdCbStreamClose)gdscloud_cb_close,
-			TRUE, FALSE);
-
-		if (!file)
-		{
-			cloud_stream_close(cs);
-			throw ErrGDSCloud("Failed to open GDS file from '%s': "
-				"the file may not exist, access may be denied, or it is not a valid GDS file", c_url);
-		}
-
-		g_open_streams.push_back(cs);
-		PROTECT(rv_ans = GDS_R_MakeFileObj(file, c_url, TRUE));
-		set_pkgname_attr(rv_ans);
-		UNPROTECT(1);
-
+		char err[256];
+		void *pd = http_provider_create(c_url, sexp_str(auth_header),
+			err, sizeof(err));
+		if (!pd)
+			throw ErrGDSCloud("Invalid HTTP URL '%s': %s", c_url, err);
+		rv_ans = open_cloud_gds(c_url, &http_provider, pd,
+			Rf_asReal(cache_size_mb));
 	COREARRAY_CATCH
 }
 
@@ -235,73 +248,21 @@ extern "C" SEXP gdscloud_open_http(SEXP url, SEXP auth_header,
 // =====================================================================
 
 extern "C" SEXP gdscloud_open_s3(SEXP url, SEXP access_key, SEXP secret_key,
-	SEXP region, SEXP session_token, SEXP cache_size_mb)
+	SEXP region, SEXP session_token, SEXP endpoint, SEXP path_style,
+	SEXP cache_size_mb)
 {
 	const char *c_url = sexp_str(url);
-	const char *c_ak  = sexp_str(access_key);
-	const char *c_sk  = sexp_str(secret_key);
-	const char *c_rgn = sexp_str(region);
-	const char *c_tok = sexp_str(session_token);
-	double c_cache = Rf_asReal(cache_size_mb);
-
 	COREARRAY_TRY
-
-		// validate URL format
-		if (!c_url || !c_url[0])
+		if (!c_url[0])
 			throw ErrGDSCloud("S3 URL is empty or missing");
-		if (strncmp(c_url, "s3://", 5) != 0)
-			throw ErrGDSCloud("Invalid S3 URL '%s': must start with 's3://'", c_url);
-		if (!strchr(c_url + 5, '/'))
-			throw ErrGDSCloud("Invalid S3 URL '%s': missing object key (expected 's3://bucket/key')", c_url);
-
-		// create S3 backend
-		S3BackendData *s3 = s3_backend_create(c_url, c_ak, c_sk, c_rgn, c_tok);
-		if (!s3)
-			throw ErrGDSCloud("Failed to create S3 backend for '%s'", c_url);
-
-		// create cloud stream with cache
-		long long max_cache = (long long)(c_cache * 1024 * 1024);
-		CloudStream *cs = cloud_stream_create(c_url,
-			&s3_backend_vtable, s3, CLOUD_BLOCK_SIZE, max_cache);
-		if (!cs)
-		{
-			s3_backend_vtable.close(s3);
-			throw ErrGDSCloud("Failed to create cloud stream for '%s'", c_url);
-		}
-
-		// pre-check file access to get detailed error on failure
-		if (cloud_stream_getsize(cs) < 0)
-		{
-			const char *err = cloud_stream_get_last_error(cs);
-			std::string msg = (err && err[0]) ? std::string(err)
-				: std::string("Failed to access '") + c_url + "'";
-			cloud_stream_close(cs);
-			throw ErrGDSCloud(msg);
-		}
-
-		// open via gdsfmt callback API
-		PdGDSFile file = GDS_File_Open_Callback(
-			cs,
-			(TdCbStreamRead)gdscloud_cb_read,
-			(TdCbStreamWrite)NULL,
-			(TdCbStreamSeek)gdscloud_cb_seek,
-			(TdCbStreamGetSize)gdscloud_cb_getsize,
-			(TdCbStreamSetSize)NULL,
-			(TdCbStreamClose)gdscloud_cb_close,
-			TRUE, FALSE);
-
-		if (!file)
-		{
-			cloud_stream_close(cs);
-			throw ErrGDSCloud("Failed to open GDS file from '%s': "
-				"the file may not exist, access may be denied, or it is not a valid GDS file", c_url);
-		}
-
-		g_open_streams.push_back(cs);
-		PROTECT(rv_ans = GDS_R_MakeFileObj(file, c_url, TRUE));
-		set_pkgname_attr(rv_ans);
-		UNPROTECT(1);
-
+		char err[512];
+		void *pd = s3_provider_create(c_url, sexp_str(access_key),
+			sexp_str(secret_key), sexp_str(region), sexp_str(session_token),
+			sexp_str(endpoint), sexp_flag(path_style), err, sizeof(err));
+		if (!pd)
+			throw ErrGDSCloud("Invalid S3 URL '%s': %s", c_url, err);
+		rv_ans = open_cloud_gds(c_url, &s3_provider, pd,
+			Rf_asReal(cache_size_mb));
 	COREARRAY_CATCH
 }
 
@@ -313,64 +274,16 @@ extern "C" SEXP gdscloud_open_s3(SEXP url, SEXP access_key, SEXP secret_key,
 extern "C" SEXP gdscloud_open_gcs(SEXP url, SEXP access_token, SEXP cache_size_mb)
 {
 	const char *c_url = sexp_str(url);
-	const char *c_tok = sexp_str(access_token);
-	double c_cache = Rf_asReal(cache_size_mb);
-
 	COREARRAY_TRY
-
-		// validate URL format
-		if (!c_url || !c_url[0])
+		if (!c_url[0])
 			throw ErrGDSCloud("GCS URL is empty or missing");
-		if (strncmp(c_url, "gs://", 5) != 0)
-			throw ErrGDSCloud("Invalid GCS URL '%s': must start with 'gs://'", c_url);
-		if (!strchr(c_url + 5, '/'))
-			throw ErrGDSCloud("Invalid GCS URL '%s': missing object key (expected 'gs://bucket/key')", c_url);
-
-		GCSBackendData *gcs = gcs_backend_create(c_url, c_tok);
-		if (!gcs)
-			throw ErrGDSCloud("Failed to create GCS backend for '%s'", c_url);
-
-		long long max_cache = (long long)(c_cache * 1024 * 1024);
-		CloudStream *cs = cloud_stream_create(c_url,
-			&gcs_backend_vtable, gcs, CLOUD_BLOCK_SIZE, max_cache);
-		if (!cs)
-		{
-			gcs_backend_vtable.close(gcs);
-			throw ErrGDSCloud("Failed to create cloud stream for '%s'", c_url);
-		}
-
-		// pre-check file access to get detailed error on failure
-		if (cloud_stream_getsize(cs) < 0)
-		{
-			const char *err = cloud_stream_get_last_error(cs);
-			std::string msg = (err && err[0]) ? std::string(err)
-				: std::string("Failed to access '") + c_url + "'";
-			cloud_stream_close(cs);
-			throw ErrGDSCloud(msg);
-		}
-
-		PdGDSFile file = GDS_File_Open_Callback(
-			cs,
-			(TdCbStreamRead)gdscloud_cb_read,
-			(TdCbStreamWrite)NULL,
-			(TdCbStreamSeek)gdscloud_cb_seek,
-			(TdCbStreamGetSize)gdscloud_cb_getsize,
-			(TdCbStreamSetSize)NULL,
-			(TdCbStreamClose)gdscloud_cb_close,
-			TRUE, FALSE);
-
-		if (!file)
-		{
-			cloud_stream_close(cs);
-			throw ErrGDSCloud("Failed to open GDS file from '%s': "
-				"the file may not exist, access may be denied, or it is not a valid GDS file", c_url);
-		}
-
-		g_open_streams.push_back(cs);
-		PROTECT(rv_ans = GDS_R_MakeFileObj(file, c_url, TRUE));
-		set_pkgname_attr(rv_ans);
-		UNPROTECT(1);
-
+		char err[256];
+		void *pd = gcs_provider_create(c_url, sexp_str(access_token),
+			err, sizeof(err));
+		if (!pd)
+			throw ErrGDSCloud("Invalid GCS URL '%s': %s", c_url, err);
+		rv_ans = open_cloud_gds(c_url, &gcs_provider, pd,
+			Rf_asReal(cache_size_mb));
 	COREARRAY_CATCH
 }
 
@@ -380,78 +293,138 @@ extern "C" SEXP gdscloud_open_gcs(SEXP url, SEXP access_token, SEXP cache_size_m
 // =====================================================================
 
 extern "C" SEXP gdscloud_open_azure(SEXP url, SEXP account_name, SEXP account_key,
-	SEXP sas_token, SEXP cache_size_mb)
+	SEXP sas_token, SEXP access_token, SEXP endpoint_suffix, SEXP endpoint,
+	SEXP cache_size_mb)
 {
 	const char *c_url = sexp_str(url);
-	const char *c_acc = sexp_str(account_name);
-	const char *c_key = sexp_str(account_key);
-	const char *c_sas = sexp_str(sas_token);
-	double c_cache = Rf_asReal(cache_size_mb);
-
 	COREARRAY_TRY
-
-		// validate URL format
-		if (!c_url || !c_url[0])
+		if (!c_url[0])
 			throw ErrGDSCloud("Azure URL is empty or missing");
-		if (strncmp(c_url, "az://", 5) != 0)
-			throw ErrGDSCloud("Invalid Azure URL '%s': must start with 'az://'", c_url);
-		if (!strchr(c_url + 5, '/'))
-			throw ErrGDSCloud("Invalid Azure URL '%s': missing blob name (expected 'az://container/blob')", c_url);
-		if (!c_acc || !c_acc[0])
-			throw ErrGDSCloud("Azure account name is required for '%s'", c_url);
-
-		AzureBackendData *az = azure_backend_create(c_url, c_acc, c_key, c_sas);
-		if (!az)
-			throw ErrGDSCloud("Failed to create Azure backend for '%s'", c_url);
-
-		long long max_cache = (long long)(c_cache * 1024 * 1024);
-		CloudStream *cs = cloud_stream_create(c_url,
-			&azure_backend_vtable, az, CLOUD_BLOCK_SIZE, max_cache);
-		if (!cs)
-		{
-			azure_backend_vtable.close(az);
-			throw ErrGDSCloud("Failed to create cloud stream for '%s'", c_url);
-		}
-
-		// pre-check file access to get detailed error on failure
-		if (cloud_stream_getsize(cs) < 0)
-		{
-			const char *err = cloud_stream_get_last_error(cs);
-			std::string msg = (err && err[0]) ? std::string(err)
-				: std::string("Failed to access '") + c_url + "'";
-			cloud_stream_close(cs);
-			throw ErrGDSCloud(msg);
-		}
-
-		PdGDSFile file = GDS_File_Open_Callback(
-			cs,
-			(TdCbStreamRead)gdscloud_cb_read,
-			(TdCbStreamWrite)NULL,
-			(TdCbStreamSeek)gdscloud_cb_seek,
-			(TdCbStreamGetSize)gdscloud_cb_getsize,
-			(TdCbStreamSetSize)NULL,
-			(TdCbStreamClose)gdscloud_cb_close,
-			TRUE, FALSE);
-
-		if (!file)
-		{
-			cloud_stream_close(cs);
-			throw ErrGDSCloud("Failed to open GDS file from '%s': "
-				"the file may not exist, access may be denied, or it is not a valid GDS file", c_url);
-		}
-
-		g_open_streams.push_back(cs);
-		PROTECT(rv_ans = GDS_R_MakeFileObj(file, c_url, TRUE));
-		set_pkgname_attr(rv_ans);
-		UNPROTECT(1);
-
+		char err[512];
+		void *pd = azure_provider_create(c_url, sexp_str(account_name),
+			sexp_str(account_key), sexp_str(sas_token), sexp_str(access_token),
+			sexp_str(endpoint_suffix), sexp_str(endpoint), err, sizeof(err));
+		if (!pd)
+			throw ErrGDSCloud("Cannot open '%s': %s", c_url, err);
+		rv_ans = open_cloud_gds(c_url, &azure_provider, pd,
+			Rf_asReal(cache_size_mb));
 	COREARRAY_CATCH
 }
 
 
 // =====================================================================
-// .Call: Clear cache (placeholder - individual stream caches are
-//        freed when streams close; this is a no-op for now)
+// .Call: Build the request a provider would send, without sending it
+//   gdscloud_prepare_request(url, params, range, time)
+// `params` is a named character list of provider credentials; used by
+// the unit tests to check signatures against published test vectors.
+// Returns list(url=, headers=).
+// =====================================================================
+
+static const char *param(SEXP lst, const char *name)
+{
+	if (TYPEOF(lst) != VECSXP) return "";
+	SEXP names = Rf_getAttrib(lst, R_NamesSymbol);
+	if (TYPEOF(names) != STRSXP) return "";
+	for (R_xlen_t i = 0; i < Rf_xlength(lst); i++)
+	{
+		if (strcmp(CHAR(STRING_ELT(names, i)), name) == 0)
+			return sexp_str(VECTOR_ELT(lst, i));
+	}
+	return "";
+}
+
+extern "C" SEXP gdscloud_prepare_request(SEXP url, SEXP params, SEXP range,
+	SEXP time_utc)
+{
+	const char *c_url = sexp_str(url);
+	COREARRAY_TRY
+		const CurlProvider *provider = NULL;
+		void *pd = NULL;
+		char err[512];
+		if (strncmp(c_url, "http://", 7) == 0 || strncmp(c_url, "https://", 8) == 0)
+		{
+			provider = &http_provider;
+			pd = http_provider_create(c_url, param(params, "auth"), err, sizeof(err));
+		}
+		else if (strncmp(c_url, "s3://", 5) == 0)
+		{
+			provider = &s3_provider;
+			int ps = -1;
+			if (strcmp(param(params, "path_style"), "TRUE") == 0) ps = 1;
+			else if (strcmp(param(params, "path_style"), "FALSE") == 0) ps = 0;
+			pd = s3_provider_create(c_url, param(params, "access_key"),
+				param(params, "secret_key"), param(params, "region"),
+				param(params, "session_token"), param(params, "endpoint"),
+				ps, err, sizeof(err));
+		}
+		else if (strncmp(c_url, "gs://", 5) == 0)
+		{
+			provider = &gcs_provider;
+			pd = gcs_provider_create(c_url, param(params, "access_token"),
+				err, sizeof(err));
+		}
+		else if (strncmp(c_url, "az://", 5) == 0)
+		{
+			provider = &azure_provider;
+			pd = azure_provider_create(c_url, param(params, "account_name"),
+				param(params, "account_key"), param(params, "sas_token"),
+				param(params, "access_token"), param(params, "endpoint_suffix"),
+				param(params, "endpoint"), err, sizeof(err));
+		}
+		else
+			throw ErrGDSCloud("Unsupported URL '%s'", c_url);
+		if (!pd)
+			throw ErrGDSCloud("Invalid URL '%s': %s", c_url, err);
+
+		CurlRequest req;
+		req.url[0] = '\0';
+		req.headers = NULL;
+		err[0] = '\0';
+		int rc = provider->prepare(pd, sexp_str(range),
+			(time_t)Rf_asReal(time_utc), &req, err, sizeof(err));
+		std::vector<std::string> hdrs;
+		for (struct curl_slist *p = req.headers; p; p = p->next)
+			hdrs.push_back(p->data);
+		std::string req_url(req.url);
+		if (req.headers) curl_slist_free_all(req.headers);
+		provider->free_data(pd);
+		if (rc != 0)
+			throw ErrGDSCloud("%s: %s", provider->name, err);
+
+		rv_ans = PROTECT(Rf_allocVector(VECSXP, 2));
+		SEXP names = PROTECT(Rf_allocVector(STRSXP, 2));
+		SET_STRING_ELT(names, 0, Rf_mkChar("url"));
+		SET_STRING_ELT(names, 1, Rf_mkChar("headers"));
+		Rf_setAttrib(rv_ans, R_NamesSymbol, names);
+		SET_VECTOR_ELT(rv_ans, 0, Rf_mkString(req_url.c_str()));
+		SEXP hv = PROTECT(Rf_allocVector(STRSXP, hdrs.size()));
+		for (size_t i = 0; i < hdrs.size(); i++)
+			SET_STRING_ELT(hv, i, Rf_mkChar(hdrs[i].c_str()));
+		SET_VECTOR_ELT(rv_ans, 1, hv);
+		UNPROTECT(3);
+	COREARRAY_CATCH
+}
+
+
+// =====================================================================
+// .Call: Set the transfer options (timeouts in seconds, max retries)
+// =====================================================================
+
+extern "C" SEXP gdscloud_set_options(SEXP connect_timeout, SEXP timeout,
+	SEXP max_retries)
+{
+	double ct = Rf_asReal(connect_timeout), lt = Rf_asReal(timeout);
+	double mr = Rf_asReal(max_retries);
+	cloud_set_timeouts(
+		(R_FINITE(ct) && ct > 0) ? (long)ct : 0,
+		(R_FINITE(lt) && lt > 0) ? (long)lt : 0);
+	cloud_set_max_retries((R_FINITE(mr) && mr >= 0) ? (int)mr : -1);
+	return R_NilValue;
+}
+
+
+// =====================================================================
+// .Call: Clear the block caches of all open cloud streams
 // =====================================================================
 
 extern "C" SEXP gdscloud_cache_clear(void)
@@ -475,16 +448,18 @@ extern "C" SEXP gdscloud_cache_info(void)
 		total_misses += g_open_streams[i]->cache.total_misses;
 	}
 
-	SEXP ans = PROTECT(Rf_allocVector(VECSXP, 3));
-	SEXP names = PROTECT(Rf_allocVector(STRSXP, 3));
+	SEXP ans = PROTECT(Rf_allocVector(VECSXP, 4));
+	SEXP names = PROTECT(Rf_allocVector(STRSXP, 4));
 	SET_STRING_ELT(names, 0, Rf_mkChar("num_streams"));
 	SET_STRING_ELT(names, 1, Rf_mkChar("hits"));
 	SET_STRING_ELT(names, 2, Rf_mkChar("misses"));
+	SET_STRING_ELT(names, 3, Rf_mkChar("retries"));
 	Rf_setAttrib(ans, R_NamesSymbol, names);
 
 	SET_VECTOR_ELT(ans, 0, Rf_ScalarInteger((int)g_open_streams.size()));
 	SET_VECTOR_ELT(ans, 1, Rf_ScalarReal((double)total_hits));
 	SET_VECTOR_ELT(ans, 2, Rf_ScalarReal((double)total_misses));
+	SET_VECTOR_ELT(ans, 3, Rf_ScalarReal((double)cloud_total_retries()));
 
 	UNPROTECT(2);
 	return ans;

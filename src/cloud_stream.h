@@ -72,7 +72,7 @@ typedef struct BlockCache {
 
 
 // =====================================================================
-// Backend vtable (each cloud provider implements these)
+// Backend vtable (implemented by the generic curl backend, curl_backend.c)
 // =====================================================================
 
 typedef struct CloudBackend {
@@ -135,6 +135,52 @@ void cloud_format_error(char *out, size_t out_size,
 	const char *prefix, const char *endpoint,
 	CURLcode res, long http_code,
 	const unsigned char *body, long long body_len);
+
+
+// =====================================================================
+// Transfer setup shared by the backends: timeouts and user interrupts
+//
+// Without timeouts a stalled connection blocks R forever, and a plain
+// R_CheckUserInterrupt() from inside a transfer would longjmp through the
+// C++ frames of gdsfmt. cloud_curl_setup() installs a connect timeout, a
+// low-speed timeout and a progress callback that polls for a pending
+// interrupt (confined with R_ToplevelExec) and aborts the transfer;
+// cloud_transfer_interrupted() turns that abort into an error message.
+// =====================================================================
+
+typedef struct CloudTransfer {
+	int interrupted;             // set by the progress callback / back-off sleep
+} CloudTransfer;
+
+/// Set the timeouts used by cloud_curl_setup() (seconds; <= 0 keeps the
+/// current value). `low_speed_time`: abort when < 1 byte/s for this long.
+void cloud_set_timeouts(long connect_timeout, long low_speed_time);
+
+/// Set the maximum number of retries for transient failures (< 0 keeps
+/// the current value; 0 disables retrying)
+void cloud_set_max_retries(int max_retries);
+
+/// Total number of retried requests since the package was loaded
+long long cloud_total_retries(void);
+
+/// Retry decision after one curl_easy_perform(). Transient failures
+/// (connection reset, timeout, HTTP 408/429/5xx) are retried with
+/// exponential back-off (0.5 s doubling up to 8 s), at most the configured
+/// number of times. Returns 1 if the caller should perform the request
+/// again (the back-off sleep has already happened), 0 to stop. The sleep
+/// is interruptible; on interrupt `tr->interrupted` is set and 0 returned.
+int cloud_should_retry(CloudTransfer *tr, CURLcode res, CURL *curl,
+	int attempt);
+
+/// Apply timeouts and the interrupt-checking progress callback to `curl`
+/// (call after curl_easy_reset() and before curl_easy_perform())
+void cloud_curl_setup(CURL *curl, CloudTransfer *tr);
+
+/// After the transfer: if it was aborted by a user interrupt (during the
+/// transfer or a back-off sleep), write a message into `err` and return 1;
+/// otherwise 0
+int cloud_transfer_interrupted(const CloudTransfer *tr, CURLcode res,
+	const char *prefix, char *err, size_t err_size);
 
 
 // =====================================================================

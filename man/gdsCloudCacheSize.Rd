@@ -20,11 +20,15 @@ gdsCloudCacheInfo(verbose=TRUE)
     HTTP requests. The default cache size is 64 MB per stream.
 
     \code{gdsCloudCacheSize} sets the default cache size for
-    subsequently opened streams.
+    subsequently opened streams (the same setting as the
+    \code{cache_size} option of \code{\link{gdsCloudOptions}}).
 
     \code{gdsCloudCacheClear} frees cached data.
 
-    \code{gdsCloudCacheInfo} prints cache statistics.
+    \code{gdsCloudCacheInfo} prints cache statistics: the number of open
+    cloud streams, cache hits and misses summed over the open streams, and
+    the number of requests that were retried after a transient failure
+    (see \code{\link{gdsCloudOptions}}).
 }
 \value{
     \code{gdsCloudCacheSize}: the new cache size (invisible).
@@ -32,7 +36,7 @@ gdsCloudCacheInfo(verbose=TRUE)
     \code{gdsCloudCacheInfo}: a list with cache statistics (invisible).
 }
 \seealso{
-    \code{\link{gdsCloudOpen}}
+    \code{\link{gdsCloudOpen}}, \code{\link{gdsCloudOptions}}
 }
 \examples{
 # Increase cache to 128 MB

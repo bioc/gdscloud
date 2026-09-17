@@ -31,6 +31,13 @@ gdsCloudExportCredentials(cl)
     and configuring credentials in the parent session, and before
     invoking \code{\link[SeqArray]{seqParallel}}.
 
+    Tokens given as provider functions and the AWS \code{credentials}
+    function (see \code{\link{gdsCloudConfigS3}}) are serialized to the
+    workers
+    together with their enclosing environments, and are called on the
+    worker when it opens a file; the packages and login state they rely
+    on must therefore be available there as well.
+
     On Unix, when \code{cl} is \code{TRUE} or a numeric value,
     \code{seqParallel()} uses forking and child processes inherit the
     parent's in-memory credentials automatically, so this function is a
@@ -63,6 +70,9 @@ gdsCloudConfigS3(aws_access_key_id="AKID", aws_secret_access_key="secret")
 cl <- makeCluster(2L)
 gdsCloudExportCredentials(cl)
 stopCluster(cl)
+
+# forget the example credentials again
+gdsCloudConfigS3(aws_access_key_id="", aws_secret_access_key="")
 }
 }
 \keyword{GDS}
