@@ -14,9 +14,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include <R.h>
-#include <Rinternals.h>
-
 #ifdef _WIN32
 #include <windows.h>
 #ifndef strncasecmp
@@ -255,11 +252,12 @@ void cloud_format_error(char *out, size_t out_size,
 
 
 // =====================================================================
-// Transfer setup: timeouts and user interrupts
+// Transfer setup: timeouts, user interrupts and the CA bundle
 // =====================================================================
 
 static long g_connect_timeout = 30;   // seconds
 static long g_low_speed_time = 60;    // seconds below 1 byte/s before abort
+static char *g_ca_bundle = NULL;      // NULL: the libcurl default
 
 void cloud_set_timeouts(long connect_timeout, long low_speed_time)
 {
@@ -267,18 +265,26 @@ void cloud_set_timeouts(long connect_timeout, long low_speed_time)
 	if (low_speed_time > 0) g_low_speed_time = low_speed_time;
 }
 
-static void check_interrupt_fn(void *dummy)
+int cloud_set_ca_bundle(const char *path)
 {
-	(void)dummy;
-	R_CheckUserInterrupt();
+	char *s = NULL;
+	if (path && path[0])
+	{
+		s = (char *)malloc(strlen(path) + 1);
+		if (!s) return -1;
+		strcpy(s, path);
+	}
+	free(g_ca_bundle);
+	g_ca_bundle = s;
+	return 0;
 }
 
-/// 1 if an interrupt is pending. R_CheckUserInterrupt() would longjmp to
-/// the top level; running it under R_ToplevelExec() confines the jump so
-/// the transfer can be aborted and unwound through the normal error path.
+int (*cloud_interrupt_hook)(void) = NULL;
+
+/// 1 if an interrupt is pending, as reported by the host's hook
 static int pending_interrupt(void)
 {
-	return !R_ToplevelExec(check_interrupt_fn, NULL);
+	return cloud_interrupt_hook ? cloud_interrupt_hook() : 0;
 }
 
 #if LIBCURL_VERSION_NUM >= 0x072000
@@ -307,6 +313,7 @@ void cloud_curl_setup(CURL *curl, CloudTransfer *tr)
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, g_connect_timeout);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, g_low_speed_time);
+	if (g_ca_bundle) curl_easy_setopt(curl, CURLOPT_CAINFO, g_ca_bundle);
 	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 #if LIBCURL_VERSION_NUM >= 0x072000
 	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
